@@ -653,6 +653,7 @@
   "KuzuGraphStore": "llama_index.graph_stores.kuzu",
   "NebulaGraphStore": "llama_index.graph_stores.nebula",
   "NebulaPropertyGraphStore": "llama_index.graph_stores.nebula",
+  "AgensGraphStore": "llama_index.graph_stores.agensgraph",
   "OpenAIMultiModal": "llama_index.multi_modal_llms.openai",
   "OllamaMultiModal": "llama_index.multi_modal_llms.ollama",
   "AzureOpenAIMultiModal": "llama_index.multi_modal_llms.azure_openai",
