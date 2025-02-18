@@ -9,10 +9,10 @@ skip = "*.csv,*.html,*.json,*.jsonl,*.pdf,*.txt,*.ipynb"
 
 [tool.llamahub]
 contains_example = false
-import_path = "llama_index.graph_stores.kuzu"
+import_path = "llama_index.graph_stores.agensgraph"
 
 [tool.llamahub.class_authors]
-KuzuGraphStore = "llama-index"
+AgensGraphStore = "llama-index"
 KuzuPropertyGraphStore = "llama-index"
 
 [tool.mypy]
@@ -23,12 +23,12 @@ python_version = "3.8"
 
 [tool.poetry]
 authors = ["Your Name <you@example.com>"]
-description = "llama-index graph stores kuzu integration"
+description = "llama-index graph stores agensgraph integration"
 exclude = ["**/BUILD"]
 license = "MIT"
-name = "llama-index-graph-stores-kuzu"
+name = "llama-index-graph-stores-agensgraph"
 readme = "README.md"
-version = "0.6.0"
+version = "0.1.0"
 
 [tool.poetry.dependencies]
 python = ">=3.9,<4.0"
