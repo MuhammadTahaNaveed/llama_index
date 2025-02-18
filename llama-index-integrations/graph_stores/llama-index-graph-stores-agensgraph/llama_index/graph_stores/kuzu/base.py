@@ -1,9 +1,12 @@
 """Agensgraph graph store index."""
+import logging
 import json, re
 from typing import Any, Dict, List, Optional, Union, NamedTuple, Pattern, Tuple
 
 from llama_index.core.graph_stores.types import GraphStore
 import psycopg2.extras
+
+logger = logging.getLogger(__name__)
 
 flatten_function = """
     CREATE OR REPLACE FUNCTION flatten(input_array jsonb)
@@ -21,6 +24,13 @@ flatten_function = """
         RETURN result;
     END;
     $$ LANGUAGE plpgsql;
+"""
+
+rel_query = """
+    MATCH (start_node)-[r]->(end_node)
+    WITH labels(start_node) AS start, type(r) AS relationship_type, labels(end_node) AS endd, keys(r) AS relationship_properties
+    UNWIND endd as end_label
+    RETURN DISTINCT {start: start[0], type: relationship_type, end: end_label} AS output;
 """
 
 class AgensQueryException(Exception):
@@ -274,10 +284,10 @@ class AgensGraphStore(GraphStore):
 
         # fetch graph schema information
         n_labels, e_labels = self._get_labels()
-        triple_schema = self._get_triples(e_labels)
 
         node_properties = self._get_node_properties(n_labels)
         edge_properties = self._get_edge_properties(e_labels)
+        triple_schema = self._get_triples()
 
         # update the formatted string representation
         self.schema = f"""
@@ -296,6 +306,14 @@ class AgensGraphStore(GraphStore):
             "relationships": triple_schema,
             "metadata": {},
         }
+
+    def get_schema(self, refresh: bool = False) -> str:
+        """Get the schema of the FalkorDBGraph store."""
+        if self.schema and not refresh:
+            return self.schema
+        self.refresh_schema()
+        logger.debug(f"get_schema() schema:\n{self.schema}")
+        return self.schema
 
     @staticmethod
     def _record_to_dict(record: NamedTuple) -> Dict[str, Any]:
@@ -371,13 +389,6 @@ class AgensGraphStore(GraphStore):
         Returns:
             List[Dict[str, Any]]: a list of dictionaries containing the result set
         """
-        try:
-            import psycopg2
-        except ImportError as e:
-            raise ImportError(
-                "Unable to import psycopg2, please install with "
-                "`pip install -U psycopg2`."
-            ) from e
 
         # execute the query, rolling back on an error
         with self._get_cursor() as curs:
@@ -426,13 +437,6 @@ class AgensGraphStore(GraphStore):
                         ]
                 }"
         """
-        try:
-            import psycopg2
-        except ImportError as e:
-            raise ImportError(
-                "Unable to import psycopg2, please install with "
-                "`pip install -U psycopg2`."
-            ) from e
 
         # cypher query to fetch properties of a given label
         node_properties_query = """
@@ -494,14 +498,6 @@ class AgensGraphStore(GraphStore):
                         ]
                 }"
         """
-
-        try:
-            import psycopg2
-        except ImportError as e:
-            raise ImportError(
-                "Unable to import psycopg2, please install with "
-                "`pip install -U psycopg2`."
-            ) from e
         # cypher query to fetch properties of a given label
         edge_properties_query = """
             MATCH ()-[e:"{e_label}"]->()
@@ -540,77 +536,35 @@ class AgensGraphStore(GraphStore):
 
         return edge_properties
 
-    def _get_triples(self, e_labels: List[str]) -> List[Dict[str, str]]:
+    def _get_triples(self) -> List[Dict[str, str]]:
         """
         Get a set of distinct relationship types (as a list of dicts) in the graph
         to be used as context by an llm.
-
-        Args:
-            e_labels (List[str]): a list of edge labels to filter for
 
         Returns:
             List[Dict[str, str]]: relationships as a list of dicts in the format
                 "{'start':<from_label>, 'type':<edge_label>, 'end':<from_label>}"
         """
 
-        # agensgraph query to get distinct relationship types
-        try:
-            import psycopg2
-        except ImportError as e:
-            raise ImportError(
-                "Unable to import psycopg2, please install with "
-                "`pip install -U psycopg2`."
-            ) from e
-        triple_query = """
-            MATCH (a)-[e:"{e_label}"]->(b)
-            WITH a,e,b LIMIT 3000
-            RETURN DISTINCT label(a) AS fromm, type(e) AS edge, label(b) AS to
-            LIMIT 10
-        """
-
         triple_schema = []
-
-        # iterate desired edge types and add distinct relationship types to result
-        with self._get_cursor() as curs:
-            for label in e_labels:
-                q = triple_query.format(graph_name=self.graph_name, e_label=label)
-                try:
-                    curs.execute(q)
-                    data = curs.fetchall()
-
-                    for d in data:
-                        triple_schema.append(
-                            {
-                                "start": d.fromm,
-                                "type": d.edge,
-                                "end": d.to
-                            }
-                        )
-                except psycopg2.Error as e:
-                    raise AgensQueryException(
-                        {
-                            "message": "Error fetching triples",
-                            "detail": str(e),
-                        }
-                    )
-
+        triple_schema = self.query(rel_query)
+        if len(triple_schema) == 0:
+            return []
+        
+        triple_schema = [item["output"] for item in triple_schema]
         return triple_schema
 
-    def _get_triples_str(self, e_labels: List[str]) -> List[str]:
+    def _get_triples_str(self) -> List[str]:
         """
         Get a set of distinct relationship types (as a list of strings) in the graph
         to be used as context by an llm.
-
-        Args:
-            e_labels (List[str]): a list of edge labels to filter for
 
         Returns:
             List[str]: relationships as a list of strings in the format
                 "(:"<from_label>")-[:"<edge_label>"]->(:"<to_label>")"
         """
 
-        triples = self._get_triples(e_labels)
-
+        triples = self._get_triples()
         return self._format_triples(triples)
 
     @staticmethod
