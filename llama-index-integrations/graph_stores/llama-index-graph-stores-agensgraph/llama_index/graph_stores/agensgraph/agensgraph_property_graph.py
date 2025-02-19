@@ -1,6 +1,7 @@
 from typing import Any, List, Dict, Optional, Tuple, Type, NamedTuple, Pattern, Union
 import re, json
 from types import TracebackType
+import logging
 
 from llama_index.core.graph_stores.prompts import DEFAULT_CYPHER_TEMPALTE
 from llama_index.core.graph_stores.types import (
@@ -62,11 +63,21 @@ def remove_empty_values(input_dict):
     # Create a new dictionary excluding empty values
     return {key: value for key, value in input_dict.items() if value}
 
+def remove_nones(input_dict):
+    """
+    Remove entries with None values from the dictionary.
+
+    Parameters:
+    input_dict (dict): The dictionary from which None values need to be removed.
+
+    Returns:
+    dict: A new dictionary with all None values removed.
+    """
+    return {key: value for key, value in input_dict.items() if value is not None}
+
 
 BASE_ENTITY_LABEL = "__Entity__"
 BASE_NODE_LABEL = "__Node__"
-EXCLUDED_LABELS = ["ag_vertex"]
-EXCLUDED_RELS = ["ag_edge"]
 EXHAUSTIVE_SEARCH_LIMIT = 10000
 # Threshold for returning all available prop values in graph schema
 DISTINCT_VALUE_LIMIT = 10
@@ -95,12 +106,81 @@ append_label_function = """
     $$ LANGUAGE plpgsql;
 
 """
+
+label_catalog = """
+CREATE TABLE IF NOT EXISTS label_catalog (
+    graph_id oid PRIMARY KEY,
+    labels jsonb DEFAULT '[]'::jsonb
+);
+
+"""
+
+track_labels = """
+CREATE OR REPLACE FUNCTION track_labels()
+RETURNS TRIGGER AS $$
+DECLARE
+    graphid OID := {}::oid;
+    new_labels JSONB;
+BEGIN
+    INSERT INTO label_catalog (graph_id, labels)
+    VALUES (graphid, '[]'::jsonb)
+    ON CONFLICT (graph_id) DO NOTHING;
+
+    IF NEW.properties ? 'labels' THEN
+        new_labels := NEW.properties->'labels';
+        new_labels := (
+            SELECT jsonb_agg(elems)
+            FROM jsonb_array_elements_text(new_labels) AS elems
+            WHERE elems NOT IN ('__Node__', '__Entity__')
+        );
+    ELSE
+        new_labels := '[]'::jsonb;
+    END IF;
+
+    UPDATE label_catalog
+    SET labels = (
+        SELECT jsonb_agg(DISTINCT elems)
+        FROM jsonb_array_elements(COALESCE(labels, '[]'::jsonb) || COALESCE(new_labels, '[]'::jsonb)) AS elems
+    )
+    WHERE graph_id = graphid;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+"""
+
+track_labels_trigger = """
+CREATE TRIGGER track_labels_trigger
+AFTER INSERT OR UPDATE ON "{}"."__Node__"
+FOR EACH ROW EXECUTE FUNCTION track_labels();
+
+"""
+
+rel_query = """
+    MATCH (start_node)-[r]->(end_node)
+    WITH labels(start_node) AS start, type(r) AS relationship_type, labels(end_node) AS endd, keys(r) AS relationship_properties
+    UNWIND endd as end_label
+    RETURN DISTINCT {start: start[0], type: relationship_type, end: end_label} AS output;
+"""
+
+logger = logging.getLogger(__name__)
+
 class AgensPropertyGraphStore(PropertyGraphStore):
     """
     AgensGraph Property Graph Store.
 
     This class implements a AgensGraph property graph store.
     """
+
+    types = {
+        "str": "STRING",
+        "float": "DOUBLE",
+        "int": "INTEGER",
+        "list": "LIST",
+        "dict": "MAP",
+        "bool": "BOOLEAN",
+    }
 
     vertex_regex: Pattern = re.compile(r"(\w+)\[(\d+\.\d+)\](\{.*\})")
     edge_regex: Pattern = re.compile(r"(\w+)\[(\d+\.\d+)\]\[(\d+\.\d+),\s*(\d+\.\d+)\](\{.*\})")
@@ -130,9 +210,9 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                 )
             )
             execute_query(curs, graph_id_query)
-            graphid = curs.fetchone()
+            data = curs.fetchone()
 
-            if graphid is None:
+            if data is None:
                 if create:
                     create_statement = """
                         CREATE GRAPH {};
@@ -154,10 +234,15 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             graph_path = """SET graph_path = '{}';""".format(self.graph_name)
             execute_query(curs, graph_path)
 
+            # Create functions, triggers and catalog to handle multiple labels
             execute_query(curs, append_label_function)
-
+            execute_query(curs, label_catalog)
+            execute_query(curs, track_labels.format(self.graphid))
+            execute_query(curs, f'CREATE VLABEL IF NOT EXISTS "{BASE_NODE_LABEL}"')
+            execute_query(curs, track_labels_trigger.format(self.graph_name))
+            self.connection.commit()
             # self.refresh_schema()
-            # self.query(
+            # self.structured_query(
             #     """
             #     CREATE VLABEL IF NOT EXISTS "%s";
             #     CREATE CONSTRAINT ON "%s" ASSERT n.id IS UNIQUE;
@@ -181,6 +266,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             #             f"CREATE VECTOR INDEX {VECTOR_INDEX_NAME} IF NOT EXISTS "
             #             "FOR (m:__Entity__) ON m.embedding"
             #         )
+            # Also add constraint to ensure that labels property is always a jsonb array
 
     def _get_cursor(self) -> psycopg2.extras.NamedTupleCursor:
         cursor = self.connection.cursor(cursor_factory=psycopg2.extras.NamedTupleCursor)
@@ -189,6 +275,126 @@ class AgensPropertyGraphStore(PropertyGraphStore):
     @property
     def client(self) -> Any:
         return self.connection
+
+    def refresh_schema(self) -> None:
+        """
+        Refresh the graph schema information by updating the available
+        labels, relationships, and properties
+        """
+
+        # fetch graph schema information
+        n_labels, e_labels = self._get_labels()
+        print(n_labels, e_labels)
+
+        node_properties = self._get_node_properties(n_labels)
+        edge_properties = self._get_edge_properties(e_labels)
+        triple_schema = self._get_triples()
+
+        # update the formatted string representation
+        self.schema = f"""
+        Node properties are the following:
+        {node_properties}
+        Relationship properties are the following:
+        {edge_properties}
+        The relationships are the following:
+        {self._format_triples(triple_schema)}
+        """
+
+        # update the dictionary representation
+        self.structured_schema = {
+            "node_props": {el["labels"]: el["properties"] for el in node_properties},
+            "rel_props": {el["type"]: el["properties"] for el in edge_properties},
+            "relationships": triple_schema,
+            "metadata": {},
+        }
+
+    def get_schema(self, refresh: bool = False) -> str:
+        """Get the schema of the FalkorDBGraph store."""
+        if self.schema and not refresh:
+            return self.schema
+        self.refresh_schema()
+        logger.debug(f"get_schema() schema:\n{self.schema}")
+        return self.schema
+
+    def upsert_nodes(self, nodes: List[LabelledNode]) -> None:
+        # Lists to hold separated types
+        entity_dicts: List[dict] = []
+        chunk_dicts: List[dict] = []
+
+        # Sort by type
+        for item in nodes:
+            if isinstance(item, EntityNode):
+                entity_dicts.append({**item.dict(), "id": item.id})
+            elif isinstance(item, ChunkNode):
+                chunk_dicts.append({**item.dict(), "id": item.id})
+            else:
+                # Log that we do not support these types of nodes
+                # Or raise an error?
+                pass
+
+        if chunk_dicts:
+            for index in range(0, len(chunk_dicts), CHUNK_SIZE):
+                chunked_params = chunk_dicts[index : index + CHUNK_SIZE]
+                chunked_params = [remove_nones(row) for row in chunked_params]
+                self.structured_query(
+                    """
+                    UNWIND {} AS row
+                    MERGE (c:"{BASE_NODE_LABEL}" {{id: row.id}})
+                    SET c.text = row.text, c.labels = append_label(c.labels, 'Chunk')
+                    WITH c, row
+                    SET c += row.properties, c.embedding = row.embedding
+                    RETURN count(*)
+                    """.format(chunked_params, BASE_NODE_LABEL=BASE_NODE_LABEL),
+                )
+
+        if entity_dicts:
+            for index in range(0, len(entity_dicts), CHUNK_SIZE):
+                chunked_params = entity_dicts[index : index + CHUNK_SIZE]
+                chunked_params = [remove_nones(row) for row in chunked_params]
+                self.structured_query(
+                    """
+                    UNWIND {chunked_params} AS row
+                    MERGE (e:"{BASE_NODE_LABEL}" {{id: row.id}})
+                    SET e += CASE WHEN row.properties IS NOT NULL THEN row.properties ELSE properties(e) END
+                    SET e.name = CASE WHEN row.name IS NOT NULL THEN row.name ELSE e.name END,
+                        e.labels = append_label(e.labels, '{BASE_ENTITY_LABEL}')
+                    WITH e, row
+                    SET e.labels = append_label(e.labels, row.label);
+
+                    UNWIND {chunked_params} AS row
+                    MATCH (e:"{BASE_NODE_LABEL}" {{id: row.id}})
+                    WHERE row.embedding IS NOT NULL
+                    SET e.embedding = row.embedding
+                    WITH e, row
+                    WHERE row.properties.triplet_source_id IS NOT NULL
+                    MERGE (c:"{BASE_NODE_LABEL}" {{id: row.properties.triplet_source_id}})
+                    MERGE (e)<-[:MENTIONS]-(c)
+                    """.format(chunked_params=chunked_params,
+                               BASE_NODE_LABEL=BASE_NODE_LABEL, 
+                               BASE_ENTITY_LABEL=BASE_ENTITY_LABEL),
+                )
+
+    def upsert_relations(self, relations: List[Relation]) -> None:
+        """Add relations."""
+        params = [r.dict() for r in relations]
+        for index in range(0, len(params), CHUNK_SIZE):
+            chunked_params = params[index : index + CHUNK_SIZE]
+            for param in chunked_params:
+                formatted_properties = ", ".join(
+                    [f"{key}: {value!r}" for key, value in param["properties"].items()]
+                )
+                self.structured_query(
+                    f"""
+                    MERGE (source: "{BASE_NODE_LABEL}" {{id: "{param["source_id"]}"}})
+                    ON CREATE SET source.labels = append_label(source.labels, 'Chunk')
+                    MERGE (target: "{BASE_NODE_LABEL}" {{id: "{param["target_id"]}"}})
+                    ON CREATE SET target.labels = append_label(target.labels, 'Chunk')
+                    WITH source, target
+                    MERGE (source)-[r:"{param["label"]}"]->(target)
+                    SET r += {{{formatted_properties}}}
+                    RETURN count(*)
+                    """
+                )
 
     def get(
         self,
@@ -237,73 +443,6 @@ class AgensPropertyGraphStore(PropertyGraphStore):
     ) -> Tuple[List[LabelledNode], List[float]]:
         """Query the graph store with a vector store query."""
         return [], []
-
-    # TODO:
-    # def refresh_schema()
-
-    def upsert_nodes(self, nodes: List[LabelledNode]) -> None:
-        # Lists to hold separated types
-        entity_dicts: List[dict] = []
-        chunk_dicts: List[dict] = []
-
-        # Sort by type
-        # replace embedding value from None to empty list
-        # and if other key, than to empty string
-        for item in nodes:
-            if isinstance(item, EntityNode):
-                entity_dicts.append({**item.dict(), "id": item.id})
-            elif isinstance(item, ChunkNode):
-                chunk_dicts.append({**item.dict(), "id": item.id})
-            else:
-                # Log that we do not support these types of nodes
-                # Or raise an error?
-                pass
-
-        if chunk_dicts:
-            for index in range(0, len(chunk_dicts), CHUNK_SIZE):
-                chunked_params = chunk_dicts[index : index + CHUNK_SIZE]
-                chunked_params = [remove_empty_values(row) for row in chunked_params]
-                print(chunked_params)
-                self.structured_query(
-                    """
-                    UNWIND {} AS row
-                    MERGE (c:{BASE_NODE_LABEL} {{id: row.id}})
-                    SET c.text = row.text, c.labels = append_label(c.labels, 'Chunk')
-                    WITH c, row
-                    SET c += row.properties
-                    WITH c, row.embedding AS embedding
-                    WHERE embedding IS NOT NULL
-                    SET c.embedding = embedding
-                    RETURN count(*)
-                    """.format(chunked_params, BASE_NODE_LABEL=BASE_NODE_LABEL),
-                )
-
-        if entity_dicts:
-            for index in range(0, len(entity_dicts), CHUNK_SIZE):
-                chunked_params = entity_dicts[index : index + CHUNK_SIZE]
-                chunked_params = [remove_empty_values(row) for row in chunked_params]
-                print(chunked_params)
-                # TODO: verify the query
-                self.structured_query(
-                    """
-                    UNWIND {} AS row
-                    MERGE (e:"{BASE_NODE_LABEL}" {{id: row.id}})
-                    SET e += CASE WHEN row.properties IS NOT NULL THEN row.properties ELSE properties(e) END
-                    SET e.name = CASE WHEN row.name IS NOT NULL THEN row.name ELSE e.name END,
-                        e.labels = append_label(e.labels, '{BASE_ENTITY_LABEL}')
-                    WITH e, row
-                    SET e.labels = append_label(e.labels, row.label)
-                    WITH e, row
-                    WHERE row.embedding IS NOT NULL
-                    SET e.embedding = row.embedding
-                    WITH e, row
-                    WHERE row.properties.triplet_source_id IS NOT NULL
-                    MERGE (c:"{BASE_NODE_LABEL}" {{id: row.properties.triplet_source_id}})
-                    MERGE (e)<-[:"MENTIONS"]-(c)
-                    """.format(chunked_params,
-                               BASE_NODE_LABEL=BASE_NODE_LABEL, 
-                               BASE_ENTITY_LABEL=BASE_ENTITY_LABEL),
-                )
 
     @staticmethod
     def _record_to_dict(record: NamedTuple) -> Dict[str, Any]:
@@ -933,3 +1072,209 @@ class AgensPropertyGraphStore(PropertyGraphStore):
 
 
 # KuzuPGStore = KuzuPropertyGraphStore
+
+    def _get_node_properties(self, n_labels: List[str]) -> List[Dict[str, Any]]:
+        """
+        Fetch a list of available node properties by node label to be used
+        as context for an llm
+
+        Args:
+            n_labels (List[str]): a list of node labels to filter for
+
+        Returns:
+            List[Dict[str, Any]]: a list of node labels and
+                their corresponding properties in the form
+                "{
+                    'labels': <node_label>,
+                    'properties': [
+                        {
+                            'property': <property_name>,
+                            'type': <property_type>
+                        },...
+                        ]
+                }"
+        """
+
+        # cypher query to fetch properties of a given label
+        node_properties_query = """
+            MATCH (a:"{BASE_NODE_LABEL}")
+            WHERE '{n_label}' IN a.labels
+            RETURN properties(a) AS props
+            LIMIT 100
+        """
+
+        node_properties = []
+        with self._get_cursor() as curs:
+            for label in n_labels:
+                q = node_properties_query.format(
+                    BASE_NODE_LABEL=BASE_NODE_LABEL,
+                    n_label=label
+                )
+
+                try:
+                    curs.execute(q)
+                except psycopg2.Error as e:
+                    raise AgensQueryException(
+                        {
+                            "message": "Error fetching node properties",
+                            "detail": str(e),
+                        }
+                    )
+                data = curs.fetchall()
+
+                # build a set of distinct properties
+                s = set({})
+                for d in data:
+                    for k, v in d.props.items():
+                        if k != "labels":
+                            s.add((k, self.types[type(v).__name__]))
+
+                np = {
+                    "properties": [{"property": k, "type": v} for k, v in s],
+                    "labels": label,
+                }
+                node_properties.append(np)
+
+        return node_properties
+
+    def _get_edge_properties(self, e_labels: List[str]) -> List[Dict[str, Any]]:
+        """
+        Fetch a list of available edge properties by edge label to be used
+        as context for an llm
+
+        Args:
+            e_labels (List[str]): a list of edge labels to filter for
+
+        Returns:
+            List[Dict[str, Any]]: a list of edge labels
+                and their corresponding properties in the form
+                "{
+                    'labels': <edge_label>,
+                    'properties': [
+                        {
+                            'property': <property_name>,
+                            'type': <property_type>
+                        },...
+                        ]
+                }"
+        """
+        # cypher query to fetch properties of a given label
+        edge_properties_query = """
+            MATCH ()-[e:"{e_label}"]->()
+            RETURN properties(e) AS props
+            LIMIT 100
+        """
+        edge_properties = []
+        with self._get_cursor() as curs:
+            for label in e_labels:
+                q = edge_properties_query.format(
+                    e_label=label
+                )
+
+                try:
+                    curs.execute(q)
+                except psycopg2.Error as e:
+                    raise AgensQueryException(
+                        {
+                            "message": "Error fetching edge properties",
+                            "detail": str(e),
+                        }
+                    )
+                data = curs.fetchall()
+
+                # build a set of distinct properties
+                s = set({})
+                for d in data:
+                    for k, v in d.props.items():
+                        s.add((k, self.types[type(v).__name__]))
+
+                np = {
+                    "properties": [{"property": k, "type": v} for k, v in s],
+                    "type": label,
+                }
+                edge_properties.append(np)
+
+        return edge_properties
+
+    def _get_triples(self) -> List[Dict[str, str]]:
+        """
+        Get a set of distinct relationship types (as a list of dicts) in the graph
+        to be used as context by an llm.
+
+        Returns:
+            List[Dict[str, str]]: relationships as a list of dicts in the format
+                "{'start':<from_label>, 'type':<edge_label>, 'end':<from_label>}"
+        """
+
+        triple_schema = []
+        triple_schema = self.structured_query(rel_query)
+        if len(triple_schema) == 0:
+            return []
+        
+        triple_schema = [item["output"] for item in triple_schema]
+        return triple_schema
+
+    def _get_triples_str(self) -> List[str]:
+        """
+        Get a set of distinct relationship types (as a list of strings) in the graph
+        to be used as context by an llm.
+
+        Returns:
+            List[str]: relationships as a list of strings in the format
+                "(:"<from_label>")-[:"<edge_label>"]->(:"<to_label>")"
+        """
+
+        triples = self._get_triples()
+        return self._format_triples(triples)
+
+    @staticmethod
+    def _format_triples(triples: List[Dict[str, str]]) -> List[str]:
+        """
+        Convert a list of relationships from dictionaries to formatted strings
+        to be better readable by an llm
+
+        Args:
+            triples (List[Dict[str,str]]): a list relationships in the form
+                {'start':<from_label>, 'type':<edge_label>, 'end':<from_label>}
+
+        Returns:
+            List[str]: a list of relationships in the form
+                "(:"<from_label>")-[:"<edge_label>"]->(:"<to_label>")"
+        """
+        triple_template = '(:"{start}")-[:"{type}"]->(:"{end}")'
+        triple_schema = [triple_template.format(**triple) for triple in triples]
+
+        return triple_schema
+
+    def _get_labels(self) -> Tuple[List[str], List[str]]:
+        """
+        Get all labels of a graph (for both edges and vertices)
+        by querying the graph metadata table directly
+
+        Returns
+            Tuple[List[str]]: 2 lists, the first containing vertex
+                labels and the second containing edge labels
+        """
+
+        e_labels_records = self.structured_query(
+            """
+            SELECT ARRAY(
+                    SELECT labname 
+                    FROM ag_label 
+                    WHERE labkind = 'e' 
+                    AND graphid = {}
+                    AND labname NOT IN ('ag_edge')
+                ) as labels;
+            """.format(self.graphid)
+        )
+        e_labels = e_labels_records[0]["labels"] if e_labels_records else []
+
+        n_labels_records = self.structured_query(
+            """
+            SELECT labels FROM label_catalog
+            WHERE graph_id = {}
+            """.format(self.graphid)
+        )
+        n_labels = n_labels_records[0]["labels"] if n_labels_records else []
+
+        return n_labels, e_labels
