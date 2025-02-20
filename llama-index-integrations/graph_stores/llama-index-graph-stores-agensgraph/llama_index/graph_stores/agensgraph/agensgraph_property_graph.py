@@ -91,17 +91,16 @@ LONG_TEXT_THRESHOLD = 52
 append_label_function = """
     CREATE OR REPLACE FUNCTION append_label(labels jsonb, new_label text) 
     RETURNS jsonb AS $$
-    DECLARE
-        updated_labels jsonb;
     BEGIN
         IF labels IS NULL OR jsonb_typeof(labels) <> 'array' THEN
             labels := '[]'::jsonb;
         END IF;
 
-        updated_labels := (SELECT jsonb_agg(DISTINCT elem) 
-                        FROM jsonb_array_elements_text(labels || to_jsonb(new_label)) elem);
-
-        RETURN updated_labels;
+        IF NOT labels @> to_jsonb(new_label) THEN
+            RETURN labels || jsonb_build_array(new_label);
+        ELSE
+            RETURN labels;
+        END IF;
     END;
     $$ LANGUAGE plpgsql;
 
@@ -157,11 +156,29 @@ FOR EACH ROW EXECUTE FUNCTION track_labels();
 
 """
 
-rel_query = """
+node_properties_query = f"""
+    MATCH (a:"{BASE_NODE_LABEL}")
+    UNWIND a.labels AS label
+    UNWIND keys(properties(a)) AS prop
+    WITH label, prop, properties(a)[prop] AS value 
+    WHERE prop != 'labels'
+    WITH                
+        label,
+        prop AS property,
+        COLLECT(DISTINCT value) AS values,
+        COUNT(DISTINCT value) AS distinct_count
+    WHERE label != '{BASE_ENTITY_LABEL}' 
+    RETURN label, COLLECT({{'property': property, 'values':values, 'distinct_count': distinct_count}}) as props;
+"""
+
+rel_query = f"""
     MATCH (start_node)-[r]->(end_node)
-    WITH labels(start_node) AS start, type(r) AS relationship_type, labels(end_node) AS endd, keys(r) AS relationship_properties
-    UNWIND endd as end_label
-    RETURN DISTINCT {start: start[0], type: relationship_type, end: end_label} AS output;
+    WITH DISTINCT start_node.labels AS start_labels, type(r) AS relationship_type, end_node.labels AS end_labels
+    UNWIND start_labels AS start_label
+    UNWIND end_labels AS end_label
+    WITH DISTINCT start_label, relationship_type, end_label
+    WHERE start_label != '{BASE_ENTITY_LABEL}' AND end_label != '{BASE_ENTITY_LABEL}'
+    RETURN {{start: start_label, type: relationship_type, end: end_label}} AS output
 """
 
 logger = logging.getLogger(__name__)
@@ -241,21 +258,14 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             execute_query(curs, f'CREATE VLABEL IF NOT EXISTS "{BASE_NODE_LABEL}"')
             execute_query(curs, track_labels_trigger.format(self.graph_name))
             self.connection.commit()
-            # self.refresh_schema()
-            # self.structured_query(
-            #     """
-            #     CREATE VLABEL IF NOT EXISTS "%s";
-            #     CREATE CONSTRAINT ON "%s" ASSERT n.id IS UNIQUE;
-            #     """
-            #     % (self.node_label, self.node_label)
-            # )
+            self.refresh_schema()
 
             # self.verify_vector_support()
-            # if create_indexes:
-            #     self.structured_query(
-            #         f"""CREATE CONSTRAINT IF NOT EXISTS FOR (n:`{BASE_NODE_LABEL}`)
-            #         REQUIRE n.id IS UNIQUE;"""
-            #     )
+            if create_indexes:
+                self.structured_query(
+                    f"""CREATE CONSTRAINT ON "{BASE_NODE_LABEL}"
+                        ASSERT n.id IS UNIQUE;"""
+                )
             #     self.structured_query(
             #         f"""CREATE CONSTRAINT IF NOT EXISTS FOR (n:`{BASE_ENTITY_LABEL}`)
             #         REQUIRE n.id IS UNIQUE;"""
@@ -284,25 +294,14 @@ class AgensPropertyGraphStore(PropertyGraphStore):
 
         # fetch graph schema information
         n_labels, e_labels = self._get_labels()
-        print(n_labels, e_labels)
 
-        node_properties = self._get_node_properties(n_labels)
+        node_properties = self._get_node_properties()
         edge_properties = self._get_edge_properties(e_labels)
         triple_schema = self._get_triples()
 
-        # update the formatted string representation
-        self.schema = f"""
-        Node properties are the following:
-        {node_properties}
-        Relationship properties are the following:
-        {edge_properties}
-        The relationships are the following:
-        {self._format_triples(triple_schema)}
-        """
-
         # update the dictionary representation
         self.structured_schema = {
-            "node_props": {el["labels"]: el["properties"] for el in node_properties},
+            "node_props": node_properties,
             "rel_props": {el["type"]: el["properties"] for el in edge_properties},
             "relationships": triple_schema,
             "metadata": {},
@@ -368,7 +367,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                     WITH e, row
                     WHERE row.properties.triplet_source_id IS NOT NULL
                     MERGE (c:"{BASE_NODE_LABEL}" {{id: row.properties.triplet_source_id}})
-                    MERGE (e)<-[:MENTIONS]-(c)
+                    MERGE (e)<-[:"MENTIONS"]-(c)
                     """.format(chunked_params=chunked_params,
                                BASE_NODE_LABEL=BASE_NODE_LABEL, 
                                BASE_ENTITY_LABEL=BASE_ENTITY_LABEL),
@@ -376,6 +375,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
 
     def upsert_relations(self, relations: List[Relation]) -> None:
         """Add relations."""
+        print("Upserting relations")
         params = [r.dict() for r in relations]
         for index in range(0, len(params), CHUNK_SIZE):
             chunked_params = params[index : index + CHUNK_SIZE]
@@ -385,9 +385,9 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                 )
                 self.structured_query(
                     f"""
-                    MERGE (source: "{BASE_NODE_LABEL}" {{id: "{param["source_id"]}"}})
+                    MERGE (source: "{BASE_NODE_LABEL}" {{id: '{param["source_id"]}'}})
                     ON CREATE SET source.labels = append_label(source.labels, 'Chunk')
-                    MERGE (target: "{BASE_NODE_LABEL}" {{id: "{param["target_id"]}"}})
+                    MERGE (target: "{BASE_NODE_LABEL}" {{id: '{param["target_id"]}'}})
                     ON CREATE SET target.labels = append_label(target.labels, 'Chunk')
                     WITH source, target
                     MERGE (source)-[r:"{param["label"]}"]->(target)
@@ -401,8 +401,62 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         properties: Optional[dict] = None,
         ids: Optional[List[str]] = None,
     ) -> List[LabelledNode]:
-        """Get nodes with matching values."""
-        return []
+        """Get nodes."""
+        wrapper = """SELECT t.name, t.type, t.properties - 'labels' AS properties FROM ({})t"""
+        cypher_statement = f'MATCH (e:"{BASE_NODE_LABEL}") '
+
+        cypher_statement += "WHERE e.id IS NOT NULL "
+
+        if ids:
+            cypher_statement += "AND e.id IN {} ".format(ids)
+
+        if properties:
+            prop_list = []
+            for i, prop in enumerate(properties):
+                property = properties[prop] if not isinstance(properties[prop], str) else f"'{properties[prop]}'"
+                prop_list.append(f'e."{prop}" = {property}')
+            cypher_statement += " AND " + " AND ".join(prop_list)
+
+        return_statement = f"""
+            WITH e, e.labels as labels
+            RETURN
+            e.id AS name,
+            CASE
+                WHEN '{BASE_ENTITY_LABEL}' IN labels THEN
+                    CASE
+                        WHEN length(labels) > 2 THEN labels[2]
+                        WHEN length(labels) > 1 THEN labels[1]
+                        ELSE NULL
+                    END
+                ELSE labels[0]
+            END AS type,
+            properties(e) AS properties
+        """
+        cypher_statement += return_statement
+        response = self.structured_query(wrapper.format(cypher_statement))
+        response = response if response else []
+
+        nodes = []
+        for record in response:
+            if "text" in record["properties"] or record["type"] is None:
+                text = record["properties"].pop("text", "")
+                nodes.append(
+                    ChunkNode(
+                        id_=record["name"],
+                        text=text,
+                        properties=remove_empty_values(record["properties"]),
+                    )
+                )
+            else:
+                nodes.append(
+                    EntityNode(
+                        name=record["name"],
+                        label=record["type"],
+                        properties=remove_empty_values(record["properties"]),
+                    )
+                )
+
+        return nodes
 
     def get_triplets(
         self,
@@ -411,8 +465,92 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         properties: Optional[dict] = None,
         ids: Optional[List[str]] = None,
     ) -> List[Triplet]:
-        """Get triplets with matching values."""
-        return []
+        cypher_statement = "MATCH (e)-[r]->(t) "
+        cypher_statement += f"WHERE '{BASE_ENTITY_LABEL}' IN e.labels "
+
+        if entity_names or relation_names or properties or ids:
+            cypher_statement += "AND "
+
+        if entity_names:
+            cypher_statement += "e.name IN {} ".format(entity_names)
+
+        if relation_names and entity_names:
+            cypher_statement += "AND "
+
+        if relation_names:
+            cypher_statement += "type(r) IN {} ".format(relation_names)
+
+        if ids:
+            cypher_statement += "e.id IN {} ".format(ids)
+
+        if properties:
+            prop_list = []
+            for i, prop in enumerate(properties):
+                property = properties[prop] if not isinstance(properties[prop], str) else f"'{properties[prop]}'"
+                prop_list.append(f'e."{prop}" = {property}')
+            cypher_statement += " AND ".join(prop_list)
+
+        return_statement = f"""
+        AND NOT ANY(label IN e.labels WHERE label = 'Chunk')
+            WITH *, e.labels as e_labels, t.labels as t_labels
+            RETURN type(r) as type, properties(r) as rel_prop, e.id as source_id,
+            CASE
+                WHEN '{BASE_ENTITY_LABEL}' IN e_labels THEN
+                    CASE
+                        WHEN length(e_labels) > 2 THEN e_labels[2]
+                        WHEN length(e_labels) > 1 THEN e_labels[1]
+                        ELSE NULL
+                    END
+                ELSE e_labels[0]
+            END AS source_type,
+            properties(e) AS source_properties,
+            t.id as target_id,
+            CASE
+                WHEN '{BASE_ENTITY_LABEL}' IN t_labels THEN
+                    CASE
+                        WHEN length(t_labels) > 2 THEN t_labels[2]
+                        WHEN length(t_labels) > 1 THEN t_labels[1]
+                        ELSE NULL
+                    END
+                ELSE t_labels[0]
+            END AS target_type, properties(t) AS target_properties LIMIT 100
+        """
+
+        cypher_statement += return_statement
+        wrapper = """
+                    SELECT t.type,
+                           t.rel_prop,
+                           t.source_id,
+                           t.source_type,
+                           t.source_properties - 'labels' AS source_properties,
+                           t.target_id,
+                           t.target_type,
+                           t.target_properties - 'labels' AS target_properties
+                    FROM ({})t;
+        """
+        data = self.structured_query(wrapper.format(cypher_statement))
+        data = data if data else []
+
+        triplets = []
+        for record in data:
+            source = EntityNode(
+                name=record["source_id"],
+                label=record["source_type"],
+                properties=remove_empty_values(record["source_properties"]),
+            )
+            target = EntityNode(
+                name=record["target_id"],
+                label=record["target_type"],
+                properties=remove_empty_values(record["target_properties"]),
+            )
+            rel = Relation(
+                source_id=record["source_id"],
+                target_id=record["target_id"],
+                label=record["type"],
+                properties=remove_empty_values(record["rel_prop"]),
+            )
+            triplets.append([source, rel, target])
+        return triplets
 
     def get_rel_map(
         self,
@@ -422,11 +560,89 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         ignore_rels: Optional[List[str]] = None,
     ) -> List[Triplet]:
         """Get depth-aware rel map."""
-        return []
+        triples = []
 
-    def upsert_relations(self, relations: List[Relation]) -> None:
-        """Upsert relations."""
-        return None
+        ids = [node.id for node in graph_nodes]
+        cypher_statement = f"""
+            UNWIND {[0] if len(ids) == 1 else f'range(0, {len(ids)} - 1)::jsonb'} AS idx
+            MATCH (e:"{BASE_NODE_LABEL}")
+            WHERE e.id = {ids}[idx]
+            MATCH p=(e)-[r*1..{depth}]-(other)
+            UNWIND relationships(p) AS rel
+            WITH DISTINCT rel, idx, collect(type(rel)) AS types
+            WHERE all(x IN types WHERE x <> 'MENTIONS')
+            WITH startNode(rel) AS source,
+                type(rel) AS type,
+                rel AS rel_properties,
+                endNode(rel) AS endNode,
+                idx,
+                startNode(rel).labels AS source_labels,
+                endNode(rel).labels AS target_labels
+            LIMIT {limit}
+            RETURN source.id AS source_id,
+                CASE
+                    WHEN '{BASE_ENTITY_LABEL}' IN source_labels THEN
+                        CASE
+                            WHEN length(source_labels) > 2 THEN source_labels[2]
+                            WHEN length(source_labels) > 1 THEN source_labels[1]
+                            ELSE NULL
+                        END
+                    ELSE source_labels[0]
+                END AS source_type,
+                properties(source) AS source_properties,
+                type,
+                properties(rel_properties) as rel_properties,
+                endNode.id AS target_id,
+                CASE
+                    WHEN '{BASE_ENTITY_LABEL}' IN target_labels THEN
+                        CASE
+                            WHEN length(target_labels) > 2 THEN target_labels[2]
+                            WHEN length(target_labels) > 1 THEN target_labels[1] ELSE NULL
+                        END
+                    ELSE target_labels[0]
+                END AS target_type,
+                properties(endNode) AS target_properties,
+                idx
+            ORDER BY idx
+            LIMIT {limit}
+            """
+        wrapper = """SELECT t.source_id,
+                            t.source_type,
+                            t.source_properties - 'labels' AS source_properties,
+                            t.type,
+                            t.rel_properties,
+                            t.target_id,
+                            t.target_type,
+                            t.target_properties - 'labels' AS target_properties
+                      FROM ({})t;
+          """
+        response = self.structured_query(wrapper.format(cypher_statement))
+        response = response if response else []
+
+        ignore_rels = ignore_rels or []
+        for record in response:
+            if record["type"] in ignore_rels:
+                continue
+
+            source = EntityNode(
+                name=record["source_id"],
+                label=record["source_type"],
+                properties=remove_empty_values(record["source_properties"]),
+            )
+            target = EntityNode(
+                name=record["target_id"],
+                label=record["target_type"],
+                properties=remove_empty_values(record["target_properties"]),
+            )
+            rel = Relation(
+                source_id=record["source_id"],
+                target_id=record["target_id"],
+                label=record["type"],
+                properties=remove_empty_values(record["rel_properties"]),
+            )
+            triples.append([source, rel, target])
+
+        return triples
     
     def delete(
         self,
@@ -522,6 +738,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         # execute the query, rolling back on an error
         with self._get_cursor() as curs:
             try:
+                print(query)
                 curs.execute(query)
                 self.connection.commit()
             except psycopg2.Error as e:
@@ -545,595 +762,18 @@ class AgensPropertyGraphStore(PropertyGraphStore):
 
             return result
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-#     def validate_relationship_schema(self, relationship_schema: List[Triple]) -> None:
-#         # Check that validation schema is a list of tuples as required by Kùzu for relationships
-#         if not all(isinstance(item, tuple) for item in relationship_schema):
-#             raise ValueError(
-#                 "Please specify the relationship schema as "
-#                 "a list of tuples, for example: [('PERSON', 'IS_CEO_OF', 'ORGANIZATION')]"
-#             )
-
-#     @property
-#     def client(self) -> kuzu.Connection:
-#         return self.connection
-
-#     def get_entities(self) -> List[str]:
-#         return sorted(
-#             set(
-#                 [rel[0] for rel in self.relationship_schema]
-#                 + [rel[2] for rel in self.relationship_schema]
-#             )
-#         )
-
-#     def upsert_nodes(self, nodes: List[LabelledNode]) -> None:
-#         entity_list: List[EntityNode] = []
-#         chunk_list: List[ChunkNode] = []
-#         node_tables = self.connection._get_node_table_names()
-
-#         for item in nodes:
-#             if isinstance(item, EntityNode):
-#                 entity_list.append(item)
-#             elif isinstance(item, ChunkNode):
-#                 chunk_list.append(item)
-
-#         for chunk in chunk_list:
-#             upsert_chunk_node_query = """
-#                 MERGE (c:Chunk {id: $id})
-#                   SET c.text = $text,
-#                       c.label = $label,
-#                       c.embedding = $embedding,
-#                       c.ref_doc_id = $ref_doc_id,
-#                       c.creation_date = date($creation_date),
-#                       c.last_modified_date = date($last_modified_date),
-#                       c.file_name = $file_name,
-#                       c.file_path = $file_path,
-#                       c.file_size = $file_size,
-#                       c.file_type = $file_type
-#                 """
-
-#             self.connection.execute(
-#                 upsert_chunk_node_query,
-#                 parameters={
-#                     "id": chunk.id_,
-#                     "text": chunk.text.strip(),
-#                     "label": chunk.label,
-#                     "embedding": chunk.embedding,
-#                     "ref_doc_id": chunk.properties.get("ref_doc_id"),
-#                     "creation_date": chunk.properties.get("creation_date"),
-#                     "last_modified_date": chunk.properties.get("last_modified_date"),
-#                     "file_name": chunk.properties.get("file_name"),
-#                     "file_path": chunk.properties.get("file_path"),
-#                     "file_size": chunk.properties.get("file_size"),
-#                     "file_type": chunk.properties.get("file_type"),
-#                 },
-#             )
-
-#         for entity in entity_list:
-#             entity_label = entity.label if entity.label in node_tables else "Entity"
-#             upsert_entity_node_query = f"""
-#                 MERGE (e:{entity_label} {{id: $id}})
-#                 SET e.label = $label,
-#                     e.name = $name,
-#                     e.embedding = $embedding,
-#                     e.creation_date = date($creation_date),
-#                     e.last_modified_date = date($last_modified_date),
-#                     e.file_name = $file_name,
-#                     e.file_path = $file_path,
-#                     e.file_size = $file_size,
-#                     e.file_type = $file_type,
-#                     e.triplet_source_id = $triplet_source_id
-#                 """
-
-#             self.connection.execute(
-#                 upsert_entity_node_query,
-#                 parameters={
-#                     "id": entity.name,
-#                     "label": entity.label,
-#                     "name": entity.name,
-#                     "embedding": entity.embedding,
-#                     "creation_date": entity.properties.get("creation_date"),
-#                     "last_modified_date": entity.properties.get("last_modified_date"),
-#                     "file_name": entity.properties.get("file_name"),
-#                     "file_path": entity.properties.get("file_path"),
-#                     "file_size": entity.properties.get("file_size"),
-#                     "file_type": entity.properties.get("file_type"),
-#                     "triplet_source_id": entity.properties.get("triplet_source_id"),
-#                 },
-#             )
-
-#     def upsert_relations(self, relations: List[Relation]) -> None:
-#         for rel in relations:
-#             if self.has_structured_schema:
-#                 src, rel_tbl_name, dst = utils.lookup_relation(
-#                     rel.label, self.relationship_schema
-#                 )
-#             else:
-#                 src, rel_tbl_name, dst = "Entity", "LINKS", "Entity"
-
-#             # Connect entities to each other
-#             self.connection.execute(
-#                 f"""
-#                 MATCH (a:{src} {{id: $source_id}}),
-#                       (b:{dst} {{id: $target_id}})
-#                 MERGE (a)-[r:{rel_tbl_name} {{label: $label}}]->(b)
-#                     SET r.triplet_source_id = $triplet_source_id
-#                 """,
-#                 parameters={
-#                     "source_id": rel.source_id,
-#                     "target_id": rel.target_id,
-#                     "triplet_source_id": rel.properties.get("triplet_source_id"),
-#                     "label": rel.label,
-#                 },
-#             )
-#             # Connect chunks to entities
-#             self.connection.execute(
-#                 f"""
-#                 MATCH (a:{src} {{id: $source_id}}),
-#                         (b:{dst} {{id: $target_id}}),
-#                         (c:Chunk {{id: $triplet_source_id}})
-#                 MERGE (c)-[:MENTIONS]->(a)
-#                 MERGE (c)-[:MENTIONS]->(b)
-#                 """,
-#                 parameters={
-#                     "source_id": rel.source_id,
-#                     "target_id": rel.target_id,
-#                     "triplet_source_id": rel.properties.get("triplet_source_id"),
-#                 },
-#             )
-
-#     def structured_query(
-#         self, query: str, param_map: Optional[Dict[str, Any]] = None
-#     ) -> Any:
-#         response = self.connection.execute(query, parameters=param_map)
-#         column_names = response.get_column_names()
-#         result = []
-#         while response.has_next():
-#             row = response.get_next()
-#             result.append(dict(zip(column_names, row)))
-
-#         if self.sanitize_query_output:
-#             return value_sanitize(result)
-
-#         return result
-
-#     def vector_query(
-#         self, query: VectorStoreQuery, **kwargs: Any
-#     ) -> Tuple[List[LabelledNode], List[float]]:
-#         raise NotImplementedError(
-#             "Vector query is not currently implemented for KuzuPropertyGraphStore."
-#         )
-
-#     def get(
-#         self,
-#         properties: Optional[dict] = None,
-#         ids: Optional[List[str]] = None,
-#     ) -> List[LabelledNode]:
-#         """Get nodes from the property graph store."""
-#         cypher_statement = "MATCH (e) "
-
-#         parameters = {}
-#         if ids:
-#             cypher_statement += "WHERE e.id in $ids "
-#             parameters["ids"] = ids
-
-#         return_statement = "RETURN e.*"
-#         cypher_statement += return_statement
-#         result = self.structured_query(cypher_statement, param_map=parameters)
-#         result = result if result else []
-
-#         nodes = []
-#         for record in result:
-#             # Text indicates a chunk node
-#             # None on the label indicates an implicit node, likely a chunk node
-#             if record.get("e.label") == "text_chunk":
-#                 properties = {
-#                     k: v for k, v in record.items() if k not in ["e.id", "e.text"]
-#                 }
-#                 text = record.get("e.text")
-#                 nodes.append(
-#                     ChunkNode(
-#                         id_=record["e.id"],
-#                         text=text,
-#                         properties=utils.remove_empty_values(properties),
-#                     )
-#                 )
-#             else:
-#                 properties = {
-#                     k: v for k, v in record.items() if k not in ["e.id", "e.name"]
-#                 }
-#                 name = record["e.name"] if record.get("e.name") else record["e.id"]
-#                 label = record["e.label"] if record.get("e.label") else "Chunk"
-#                 nodes.append(
-#                     EntityNode(
-#                         name=name,
-#                         label=label,
-#                         properties=utils.remove_empty_values(properties),
-#                     )
-#                 )
-#         return nodes
-
-#     def get_triplets(
-#         self,
-#         entity_names: Optional[List[str]] = None,
-#         relation_names: Optional[List[str]] = None,
-#         ids: Optional[List[str]] = None,
-#     ) -> List[Triplet]:
-#         # Construct the Cypher query
-#         cypher_statement = "MATCH (e)-[r]->(t) "
-
-#         params = {}
-#         if entity_names or relation_names or ids:
-#             cypher_statement += "WHERE "
-
-#         if entity_names:
-#             cypher_statement += "e.name in $entity_names "
-#             params["entity_names"] = entity_names
-
-#         if relation_names and entity_names:
-#             cypher_statement += f"AND "
-#         if relation_names:
-#             cypher_statement += "r.label in $relation_names "
-#             params[f"relation_names"] = relation_names
-
-#         if ids:
-#             cypher_statement += "e.id in $ids "
-#             params["ids"] = ids
-
-#         # Avoid returning a massive list of triplets that represent a large portion of the graph
-#         # This uses the LIMIT constant defined at the top of the file
-#         if not (entity_names or relation_names or ids):
-#             return_statement = f"WHERE e.label <> 'text_chunk' RETURN * LIMIT {LIMIT};"
-#         else:
-#             return_statement = f"AND e.label <> 'text_chunk' RETURN * LIMIT {LIMIT};"
-
-#         cypher_statement += return_statement
-
-#         result = self.structured_query(cypher_statement, param_map=params)
-#         result = result if result else []
-
-#         triples = []
-#         for record in result:
-#             if record["e"]["_label"] == "Chunk":
-#                 continue
-
-#             src_table = record["e"]["_id"]["table"]
-#             dst_table = record["t"]["_id"]["table"]
-#             id_map = {src_table: record["e"]["id"], dst_table: record["t"]["id"]}
-#             source = EntityNode(
-#                 name=record["e"]["id"],
-#                 label=record["e"]["_label"],
-#                 properties=utils.get_filtered_props(record["e"], ["_id", "_label"]),
-#             )
-#             target = EntityNode(
-#                 name=record["t"]["id"],
-#                 label=record["t"]["_label"],
-#                 properties=utils.get_filtered_props(record["t"], ["_id", "_label"]),
-#             )
-#             rel = Relation(
-#                 source_id=id_map.get(record["r"]["_src"]["table"], "unknown"),
-#                 target_id=id_map.get(record["r"]["_dst"]["table"], "unknown"),
-#                 label=record["r"]["label"],
-#             )
-#             triples.append([source, rel, target])
-#         return triples
-
-#     def get_rel_map(
-#         self,
-#         graph_nodes: List[LabelledNode],
-#         depth: int = 2,
-#         limit: int = 30,
-#         ignore_rels: Optional[List[str]] = None,
-#     ) -> List[Triplet]:
-#         triples = []
-
-#         ids = [node.id for node in graph_nodes]
-#         if len(ids) > 0:
-#             # Run recursive query
-#             response = self.structured_query(
-#                 f"""
-#                 MATCH (e)
-#                 WHERE e.id IN $ids
-#                 MATCH (e)-[rel*1..{depth} (r, n | WHERE r.label <> "MENTIONS") ]->(other)
-#                 RETURN *
-#                 LIMIT {limit};
-#                 """,
-#                 param_map={"ids": ids},
-#             )
-#         else:
-#             response = self.structured_query(
-#                 f"""
-#                 MATCH (e)
-#                 MATCH (e)-[rel*1..{depth} (r, n | WHERE r.label <> "MENTIONS") ]->(other)
-#                 RETURN *
-#                 LIMIT {limit};
-#                 """
-#             )
-
-#         ignore_rels = ignore_rels or []
-#         for record in response:
-#             for item in record["rel"]["_rels"]:
-#                 if item["label"] in ignore_rels:
-#                     continue
-
-#                 src_table = item["_src"]["table"]
-#                 dst_table = item["_src"]["table"]
-#                 id_map = {
-#                     src_table: record["e"]["_id"],
-#                     dst_table: record["other"]["id"],
-#                 }
-#                 source = EntityNode(
-#                     name=record["e"]["name"],
-#                     label=record["e"]["_label"],
-#                     properties=utils.get_filtered_props(
-#                         record["e"], ["_id", "name", "_label"]
-#                     ),
-#                 )
-#                 target = EntityNode(
-#                     name=record["other"]["name"],
-#                     label=record["other"]["_label"],
-#                     properties=utils.get_filtered_props(
-#                         record["e"], ["_id", "name", "_label"]
-#                     ),
-#                 )
-#                 rel = Relation(
-#                     source_id=id_map.get(item["_src"]["table"], "unknown"),
-#                     target_id=id_map.get(item["_dst"]["table"], "unknown"),
-#                     label=item["label"],
-#                 )
-#                 triples.append([source, rel, target])
-
-#         return triples
-
-#     def delete(
-#         self,
-#         entity_names: Optional[List[str]] = None,
-#         relation_names: Optional[List[str]] = None,
-#         properties: Optional[dict] = None,
-#         ids: Optional[List[str]] = None,
-#     ) -> None:
-#         """Delete nodes and relationships from the property graph store."""
-#         if entity_names:
-#             self.structured_query(
-#                 "MATCH (n) WHERE n.name IN $entity_names DETACH DELETE n",
-#                 param_map={"entity_names": entity_names},
-#             )
-
-#         if ids:
-#             self.structured_query(
-#                 "MATCH (n) WHERE n.id IN $ids DETACH DELETE n",
-#                 param_map={"ids": ids},
-#             )
-
-#         if relation_names:
-#             for rel in relation_names:
-#                 src, _, dst = utils.lookup_relation(rel, self.relationship_schema)
-#                 self.structured_query(
-#                     f"""
-#                     MATCH (:{src})-[r {{label: $label}}]->(:{dst})
-#                     DELETE r
-#                     """,
-#                     param_map={"label": rel},
-#                 )
-
-#         if properties:
-#             assert isinstance(
-#                 properties, dict
-#             ), "`properties` should be a key-value mapping."
-#             cypher = "MATCH (e) WHERE "
-#             prop_list = []
-#             params = {}
-#             for i, prop in enumerate(properties):
-#                 prop_list.append(f"e.`{prop}` = $property_{i}")
-#                 params[f"property_{i}"] = properties[prop]
-#             cypher += " AND ".join(prop_list)
-#             self.structured_query(cypher + " DETACH DELETE e", param_map=params)
-
-#     def get_schema(self) -> Any:
-#         """
-#         Returns a structured schema of the property graph store.
-
-#         The schema contains `node_props`, `rel_props`, and `relationships` keys and
-#         the associated metadata.
-#         Example output:
-#         {
-#             'node_props': {'Chunk': [{'property': 'id', 'type': 'STRING'},
-#                                     {'property': 'text', 'type': 'STRING'},
-#                                     {'property': 'label', 'type': 'STRING'},
-#                                     {'property': 'embedding', 'type': 'DOUBLE'},
-#                                     {'property': 'properties', 'type': 'STRING'},
-#                                     {'property': 'ref_doc_id', 'type': 'STRING'}],
-#                             'Entity': [{'property': 'id', 'type': 'STRING'},
-#                                     {'property': 'name', 'type': 'STRING'},
-#                                     {'property': 'label', 'type': 'STRING'},
-#                                     {'property': 'embedding', 'type': 'DOUBLE'},
-#                                     {'property': 'properties', 'type': 'STRING'}]},
-#             'rel_props': {'SOURCE': [{'property': 'label', 'type': 'STRING'}]},
-#             'relationships': [{'end': 'Chunk', 'start': 'Chunk', 'type': 'SOURCE'}]
-#         }
-#         """
-#         current_table_schema = {"node_props": {}, "rel_props": {}, "relationships": []}
-#         node_tables = self.connection._get_node_table_names()
-#         for table_name in node_tables:
-#             node_props = self.connection._get_node_property_names(table_name)
-#             current_table_schema["node_props"][table_name] = []
-#             for prop, attr in node_props.items():
-#                 schema = {}
-#                 schema["property"] = prop
-#                 schema["type"] = attr["type"]
-#                 current_table_schema["node_props"][table_name].append(schema)
-
-#         rel_tables = self.connection._get_rel_table_names()
-#         for i, table in enumerate(rel_tables):
-#             table_name = table["name"]
-#             prop_values = self.connection.execute(
-#                 f"MATCH ()-[r:{table_name}]->() RETURN distinct r.label AS label;"
-#             )
-#             while prop_values.has_next():
-#                 rel_label = prop_values.get_next()[0]
-#                 src, dst = rel_tables[i]["src"], rel_tables[i]["dst"]
-#                 current_table_schema["relationships"].append(
-#                     {"start": src, "type": rel_label, "end": dst}
-#                 )
-#                 current_table_schema["rel_props"][rel_label] = []
-#                 table_details = self.connection.execute(
-#                     f"CALL TABLE_INFO('{table_name}') RETURN *;"
-#                 )
-#                 while table_details.has_next():
-#                     props = table_details.get_next()
-#                     rel_props = {}
-#                     rel_props["property"] = props[1]
-#                     rel_props["type"] = props[2]
-#                     current_table_schema["rel_props"][rel_label].append(rel_props)
-
-#         self.structured_schema = current_table_schema
-
-#         return self.structured_schema
-
-#     def get_schema_str(self) -> str:
-#         schema = self.get_schema()
-
-#         formatted_node_props = []
-#         formatted_rel_props = []
-
-#         # Format node properties
-#         for label, props in schema["node_props"].items():
-#             props_str = ", ".join(
-#                 [f"{prop['property']}: {prop['type']}" for prop in props]
-#             )
-#             formatted_node_props.append(f"{label} {{{props_str}}}")
-
-#         # Format relationship properties
-#         for type, props in schema["rel_props"].items():
-#             props_str = ", ".join(
-#                 [f"{prop['property']}: {prop['type']}" for prop in props]
-#             )
-#             formatted_rel_props.append(f"{type} {{{props_str}}}")
-
-#         # Format relationships
-#         formatted_rels = [
-#             f"(:{rel['start']})-[:{rel['type']}]->(:{rel['end']})"
-#             for rel in schema["relationships"]
-#         ]
-
-#         return "\n".join(
-#             [
-#                 "Node properties:",
-#                 "\n".join(formatted_node_props),
-#                 "Relationship properties:",
-#                 "\n".join(formatted_rel_props),
-#                 "The relationships:",
-#                 "\n".join(formatted_rels),
-#             ]
-#         )
-
-
-# KuzuPGStore = KuzuPropertyGraphStore
-
-    def _get_node_properties(self, n_labels: List[str]) -> List[Dict[str, Any]]:
-        """
-        Fetch a list of available node properties by node label to be used
-        as context for an llm
-
-        Args:
-            n_labels (List[str]): a list of node labels to filter for
-
-        Returns:
-            List[Dict[str, Any]]: a list of node labels and
-                their corresponding properties in the form
-                "{
-                    'labels': <node_label>,
-                    'properties': [
-                        {
-                            'property': <property_name>,
-                            'type': <property_type>
-                        },...
-                        ]
-                }"
-        """
-
-        # cypher query to fetch properties of a given label
-        node_properties_query = """
-            MATCH (a:"{BASE_NODE_LABEL}")
-            WHERE '{n_label}' IN a.labels
-            RETURN properties(a) AS props
-            LIMIT 100
-        """
-
-        node_properties = []
+    def _get_node_properties(self) -> List[Dict[str, Any]]:
+        node_properties = {}
         with self._get_cursor() as curs:
-            for label in n_labels:
-                q = node_properties_query.format(
-                    BASE_NODE_LABEL=BASE_NODE_LABEL,
-                    n_label=label
-                )
+            execute_query(curs, node_properties_query)
+            rows = curs.fetchall()
 
-                try:
-                    curs.execute(q)
-                except psycopg2.Error as e:
-                    raise AgensQueryException(
-                        {
-                            "message": "Error fetching node properties",
-                            "detail": str(e),
-                        }
-                    )
-                data = curs.fetchall()
-
-                # build a set of distinct properties
-                s = set({})
-                for d in data:
-                    for k, v in d.props.items():
-                        if k != "labels":
-                            s.add((k, self.types[type(v).__name__]))
-
-                np = {
-                    "properties": [{"property": k, "type": v} for k, v in s],
-                    "labels": label,
-                }
-                node_properties.append(np)
+            for row in rows:
+                props = row.props
+                for prop in props:
+                    prop["type"] = self.types[type(prop["values"][0]).__name__]
+                
+                node_properties[row.label] = props
 
         return node_properties
 
@@ -1171,15 +811,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                     e_label=label
                 )
 
-                try:
-                    curs.execute(q)
-                except psycopg2.Error as e:
-                    raise AgensQueryException(
-                        {
-                            "message": "Error fetching edge properties",
-                            "detail": str(e),
-                        }
-                    )
+                execute_query(curs, q)
                 data = curs.fetchall()
 
                 # build a set of distinct properties
