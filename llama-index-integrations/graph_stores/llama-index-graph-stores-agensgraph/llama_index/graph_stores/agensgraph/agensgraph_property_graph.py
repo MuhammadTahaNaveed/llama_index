@@ -260,11 +260,11 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             self.connection.commit()
             self.refresh_schema()
 
-            # self.verify_vector_support()
+            self.verify_vector_support()
             if create_indexes:
                 self.structured_query(
                     f"""CREATE CONSTRAINT ON "{BASE_NODE_LABEL}"
-                        ASSERT n.id IS UNIQUE;"""
+                        ASSERT id IS UNIQUE;"""
                 )
             #     self.structured_query(
             #         f"""CREATE CONSTRAINT IF NOT EXISTS FOR (n:`{BASE_ENTITY_LABEL}`)
@@ -285,6 +285,22 @@ class AgensPropertyGraphStore(PropertyGraphStore):
     @property
     def client(self) -> Any:
         return self.connection
+
+    def verify_vector_support(self) -> None:
+        """
+        Verify if the graph store supports vector operations
+        """
+        # check if the vector index is supported
+        self._supports_vector_index = False
+        with self._get_cursor() as curs:
+            try:
+                curs.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+                self.connection.commit()
+                self._supports_vector_index = True
+            except psycopg2.Error:
+                self.connection.rollback()
+                logger.log(logging.WARNING, """Vector extension not supported\nUnable to install pg_vector extension""")
+                pass
 
     def refresh_schema(self) -> None:
         """
@@ -402,7 +418,10 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         ids: Optional[List[str]] = None,
     ) -> List[LabelledNode]:
         """Get nodes."""
-        wrapper = """SELECT t.name, t.type, t.properties - 'labels' AS properties FROM ({})t"""
+        wrapper = """SELECT t.name,
+                            t.type,
+                            (t.properties - 'labels') || '{{"embedding": null, "id": null}}'::jsonb AS properties
+                     FROM ({})t"""
         cypher_statement = f'MATCH (e:"{BASE_NODE_LABEL}") '
 
         cypher_statement += "WHERE e.id IS NOT NULL "
@@ -522,10 +541,10 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                            t.rel_prop,
                            t.source_id,
                            t.source_type,
-                           t.source_properties - 'labels' AS source_properties,
+                           (t.source_properties - 'labels') || '{{"embedding": null, "name": null}}'::jsonb AS source_properties,
                            t.target_id,
                            t.target_type,
-                           t.target_properties - 'labels' AS target_properties
+                           (t.target_properties - 'labels') || '{{"embedding": null, "name": null}}'::jsonb AS target_properties
                     FROM ({})t;
         """
         data = self.structured_query(wrapper.format(cypher_statement))
@@ -608,12 +627,12 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             """
         wrapper = """SELECT t.source_id,
                             t.source_type,
-                            t.source_properties - 'labels' AS source_properties,
+                            (t.source_properties - 'labels') || '{{"embedding": null, "id": null}}'::jsonb AS source_properties,
                             t.type,
                             t.rel_properties,
                             t.target_id,
                             t.target_type,
-                            t.target_properties - 'labels' AS target_properties
+                            (t.target_properties - 'labels') || '{{"embedding": null, "id": null}}'::jsonb AS target_properties
                       FROM ({})t;
           """
         response = self.structured_query(wrapper.format(cypher_statement))
@@ -652,13 +671,77 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         ids: Optional[List[str]] = None,
     ) -> None:
         """Delete matching data."""
-        return None
+        if entity_names:
+            self.structured_query(
+                f"MATCH (n) WHERE n.name IN {entity_names} DETACH DELETE n"
+            )
+
+        if ids:
+            self.structured_query(
+                f"MATCH (n) WHERE n.id IN {ids} DETACH DELETE n"
+            )
+
+        if relation_names:
+            for rel in relation_names:
+                self.structured_query(f'MATCH ()-[r:"{rel}"]->() DELETE r')
+
+        if properties:
+            cypher = "MATCH (e) WHERE "
+            prop_list = []
+            for i, prop in enumerate(properties):
+                property = properties[prop] if not isinstance(properties[prop], str) else f"'{properties[prop]}'"
+                prop_list.append(f'e."{prop}" = {property}')
+            cypher += " AND ".join(prop_list)
+            self.structured_query(cypher + " DETACH DELETE e")
 
     def vector_query(
         self, query: VectorStoreQuery, **kwargs: Any
     ) -> Tuple[List[LabelledNode], List[float]]:
         """Query the graph store with a vector store query."""
-        return [], []
+        if self._supports_vector_index:
+            wrapper = """SELECT t.name,
+                                t.type,
+                                t.similarity,
+                                (t.properties - 'labels') || '{{"embedding": null, "name": null, "id": null}}'::jsonb AS properties
+                         FROM ({})t
+                         """
+            vector_query = f"""
+                    MATCH (n: "{BASE_NODE_LABEL}")
+                    WITH n,
+                         n.labels AS labels,
+                         {query.query_embedding}::vector <=> n.embedding::vector AS cos_d
+                    ORDER BY cos_d
+                    LIMIT {query.similarity_top_k}
+                    RETURN n.id as name,
+                           properties(n) AS properties,
+                           1-cos_d as similarity,
+                           CASE
+                                WHEN '{BASE_ENTITY_LABEL}' IN labels THEN
+                                    CASE
+                                        WHEN length(labels) > 2 THEN labels[2]
+                                        WHEN length(labels) > 1 THEN labels[1]
+                                        ELSE NULL
+                                    END
+                                ELSE labels[0]
+                           END AS type
+                """
+            data = self.structured_query(wrapper.format(vector_query))
+        else:
+            data = []
+        data = data if data else []
+
+        nodes = []
+        scores = []
+        for record in data:
+            node = EntityNode(
+                name=record["name"],
+                label=record["type"],
+                properties=remove_empty_values(record["properties"]),
+            )
+            nodes.append(node)
+            scores.append(record["similarity"])
+
+        return (nodes, scores)
 
     @staticmethod
     def _record_to_dict(record: NamedTuple) -> Dict[str, Any]:
