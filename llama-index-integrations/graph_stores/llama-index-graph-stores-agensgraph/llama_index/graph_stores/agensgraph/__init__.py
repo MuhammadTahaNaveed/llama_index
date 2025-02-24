@@ -1,7 +1,6 @@
 from llama_index.graph_stores.agensgraph.base import AgensGraphStore
-# from llama_index.graph_stores.kuzu.kuzu_property_graph import (
-#     KuzuPropertyGraphStore,
-# )
+from llama_index.graph_stores.agensgraph.agensgraph_property_graph import (
+    AgensPropertyGraphStore
+)
 
-# __all__ = ["KuzuGraphStore", "KuzuPropertyGraphStore"]
-__all__ = ["AgensGraphStore"]
+__all__ = ["AgensGraphStore", "AgensPropertyGraphStore"]

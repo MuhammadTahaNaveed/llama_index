@@ -1,10 +1,11 @@
 """Agensgraph graph store index."""
 import logging
 import json, re
-from typing import Any, Dict, List, Optional, Union, NamedTuple, Pattern, Tuple
+from typing import Any, Dict, List, Optional, NamedTuple, Pattern, Tuple
 
 from llama_index.core.graph_stores.types import GraphStore
 import psycopg2.extras
+from llama_index.graph_stores.agensgraph.utils import *
 
 logger = logging.getLogger(__name__)
 
@@ -33,23 +34,6 @@ rel_query = """
     RETURN DISTINCT {start: start[0], type: relationship_type, end: end_label} AS output;
 """
 
-class AgensQueryException(Exception):
-    """Exception for the Agensgraph queries."""
-
-    def __init__(self, exception: Union[str, Dict]) -> None:
-        if isinstance(exception, dict):
-            self.message = exception["message"] if "message" in exception else "unknown"
-            self.details = exception["details"] if "details" in exception else "unknown"
-        else:
-            self.message = exception
-            self.details = "unknown"
-
-    def get_message(self) -> str:
-        return self.message
-
-    def get_details(self) -> Any:
-        return self.details
-
 class AgensGraphStore(GraphStore):
 
     # python type mapping for providing readable types to LLM
@@ -76,16 +60,6 @@ class AgensGraphStore(GraphStore):
 
         self.graph_name = graph_name
         self.node_label = node_label
-
-        # check that psycopg2 is installed
-        try:
-            import psycopg2
-        except ImportError:
-            raise ImportError(
-                "Could not import psycopg2 python package. "
-                "Please install it with `pip install psycopg2`."
-            )
-
         self.connection = psycopg2.connect(**conf)
 
         with self._get_cursor() as curs:
@@ -96,7 +70,7 @@ class AgensGraphStore(GraphStore):
                 )
             )
 
-            curs.execute(graph_id_query)
+            execute_query(curs, graph_id_query)
             data = curs.fetchone()
 
             # if graph doesn't exist and create is True, create it
@@ -511,15 +485,7 @@ class AgensGraphStore(GraphStore):
                     e_label=label
                 )
 
-                try:
-                    curs.execute(q)
-                except psycopg2.Error as e:
-                    raise AgensQueryException(
-                        {
-                            "message": "Error fetching edge properties",
-                            "detail": str(e),
-                        }
-                    )
+                execute_query(curs, q)
                 data = curs.fetchall()
 
                 # build a set of distinct properties

@@ -1,48 +1,63 @@
-from typing import List, _LiteralGenericAlias, get_args, Tuple
+from typing import Any, Dict, Union, List
+import psycopg2
+from functools import wraps
 
-Triple = Tuple[str, str, str]
+class AgensQueryException(Exception):
+    """Exception for the Agensgraph queries."""
 
-def get_list_from_literal(literal: _LiteralGenericAlias) -> List[str]:
-    """
-    Get a list of strings from a Literal type.
+    def __init__(self, exception: Union[str, Dict]) -> None:
+        if isinstance(exception, dict):
+            self.message = exception["message"] if "message" in exception else "unknown"
+            self.details = exception["details"] if "details" in exception else "unknown"
+        else:
+            self.message = exception
+            self.details = "unknown"
 
-    Parameters:
-    literal (_LiteralGenericAlias): The Literal type from which to extract the strings.
+    def get_message(self) -> str:
+        return self.message
 
-    Returns:
-    List[str]: A list of strings extracted from the Literal type.
-    """
-    if not isinstance(literal, _LiteralGenericAlias):
-        raise TypeError(
-            f"{literal} must be a Literal type.\nTry using typing.Literal{literal}."
+    def get_details(self) -> Any:
+        return self.details
+
+def execute_query(curs, query, error_message = "Error executing query"):
+    try:
+        curs.execute(query)
+    except psycopg2.Error as e:
+
+        raise AgensQueryException(
+            {
+                "message": error_message,
+                "details": str(e),
+            }
         )
-    return list(get_args(literal))
 
+def require_psycopg2(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            import psycopg2
+        except ImportError:
+            raise ImportError(
+                "Could not import psycopg2 python package. "
+                "Please install it with `pip install psycopg2`."
+            )
+        return func(*args, **kwargs)
+    return wrapper
 
-def remove_empty_values(input_dict):
+def format_triples(triples: List[Dict[str, str]]) -> List[str]:
     """
-    Remove entries with empty values from the dictionary.
+    Convert a list of relationships from dictionaries to formatted strings
+    to be better readable by an llm
 
-    Parameters:
-    input_dict (dict): The dictionary from which empty values need to be removed.
+    Args:
+        triples (List[Dict[str,str]]): a list relationships in the form
+            {'start':<from_label>, 'type':<edge_label>, 'end':<from_label>}
 
     Returns:
-    dict: A new dictionary with all empty values removed.
+        List[str]: a list of relationships in the form
+            "(:"<from_label>")-[:"<edge_label>"]->(:"<to_label>")"
     """
-    # Create a new dictionary excluding empty values and remove the `e.` prefix from the keys
-    return {key.replace("e.", ""): value for key, value in input_dict.items() if value}
+    triple_template = '(:"{start}")-[:"{type}"]->(:"{end}")'
+    triple_schema = [triple_template.format(**triple) for triple in triples]
 
-
-def get_filtered_props(records: dict, filter_list: List[str]) -> dict:
-    return {k: v for k, v in records.items() if k not in filter_list}
-
-
-# Lookup entry by middle value of tuple
-def lookup_relation(relation: str, triples: List[Triple]) -> Triple:
-    """
-    Look up a triple in a list of triples by the middle value.
-    """
-    for triple in triples:
-        if triple[1] == relation:
-            return triple
-    return None
+    return triple_schema
