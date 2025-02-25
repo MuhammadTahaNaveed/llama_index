@@ -133,28 +133,6 @@ $$ LANGUAGE plpgsql;
 
 """
 
-# WIP: labels + properties.labels
-labels_function = """
-CREATE OR REPLACE FUNCTION labels(node vertex)
-RETURNS JSONB AS $$
-BEGIN
-    RETURN jsonb_build_array(node.labels) || node.properties->'labels';
-END;
-$$ LANGUAGE plpgsql;
-
-"""
-
-# WIP: properties - labels
-properties_function = """
-"""
-
-track_labels_trigger = """
-CREATE OR REPLACE TRIGGER track_labels_trigger
-AFTER INSERT OR UPDATE ON "{}"."__Node__"
-FOR EACH ROW EXECUTE FUNCTION track_labels();
-
-"""
-
 node_properties_query = f"""
     MATCH (a:"{BASE_NODE_LABEL}")
     UNWIND a.labels AS label
@@ -178,6 +156,16 @@ rel_query = f"""
     WITH DISTINCT start_label, relationship_type, end_label
     WHERE start_label != '{BASE_ENTITY_LABEL}' AND end_label != '{BASE_ENTITY_LABEL}'
     RETURN {{start: start_label, type: relationship_type, end: end_label}} AS output
+"""
+
+constraint_wrapper = """
+    DO
+    $$BEGIN
+        {}
+    EXCEPTION
+        WHEN others THEN
+            NULL;
+    END;$$;
 """
 
 logger = logging.getLogger(__name__)
@@ -210,7 +198,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         self,
         graph_name: str,
         conf: Dict[str, Any],
-        vector_dimension: int,
+        vector_dimension: int = None,
         sanitize_query_output: bool = True,
         enhanced_schema: bool = False,
         create_indexes: bool = True,
@@ -223,9 +211,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         self.enhanced_schema = enhanced_schema
         self.create_indexes = create_indexes
         self.connection = psycopg2.connect(**conf)
-
-        if vector_dimension and vector_dimension > 0:
-            self.vector_dimension = vector_dimension
+        self.vector_dimension = vector_dimension
 
         with self._get_cursor() as curs:
             graph_id_query = (
@@ -263,34 +249,40 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             execute_query(curs, label_catalog)
             execute_query(curs, track_labels.format(self.graphid))
             execute_query(curs, f'CREATE VLABEL IF NOT EXISTS "{BASE_NODE_LABEL}"')
-            execute_query(curs, track_labels_trigger.format(self.graph_name))
             self.connection.commit()
             self.refresh_schema()
 
             self.verify_vector_support()
             if create_indexes:
                 self.structured_query(
-                    f"""CREATE CONSTRAINT unique_id ON "{BASE_NODE_LABEL}"
-                        ASSERT id IS UNIQUE;"""
+                    constraint_wrapper.format(
+                        f"""CREATE CONSTRAINT unique_id 
+                            ON "{BASE_NODE_LABEL}" 
+                            ASSERT id IS UNIQUE;"""
+                    )
                 )
                 if self._supports_vector_index:
                     self.structured_query(
-                        f"""CREATE INDEX {VECTOR_INDEX_NAME} IF NOT EXISTS 
-                            ON {self.graph_name}."{BASE_NODE_LABEL}" USING hnsw
-                            (((properties->>'embedding')::vector({self.vector_dimension})) vector_cosine_ops);"""
+                            f"""CREATE INDEX IF NOT EXISTS {VECTOR_INDEX_NAME}
+                            ON {self.graph_name}."{BASE_NODE_LABEL}" USING hnsw 
+                            (((properties->>'embedding')::vector({self.vector_dimension})) vector_cosine_ops)"""
                     )
                     self.structured_query(
-                        f"""CREATE CONSTRAINT embedding_length ON "{BASE_NODE_LABEL}"
-                            ASSERT jsonb_typeof(embedding) = 'array' AND
-                                   jsonb_array_length(embedding) = 3
-                         """
+                        constraint_wrapper.format(
+                            f"""CREATE CONSTRAINT embedding_length   
+                            ON "{BASE_NODE_LABEL}" 
+                            ASSERT jsonb_typeof(embedding) = 'array' AND 
+                                   jsonb_array_length(embedding) = {self.vector_dimension};"""
+                        )
                     )
 
             # Also add constraint to ensure that labels property is always a jsonb array
             self.structured_query(
-                f"""CREATE CONSTRAINT labels_array ON "{BASE_NODE_LABEL}"
-                    ASSERT jsonb_typeof(properties->'labels') = 'array'
-                 """
+                constraint_wrapper.format(
+                    f"""CREATE CONSTRAINT labels_array 
+                        ON "{BASE_NODE_LABEL}" 
+                        ASSERT jsonb_typeof(properties->'labels') = 'array';"""
+                )
             )
 
     @require_psycopg2
@@ -314,7 +306,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             try:
                 curs.execute("CREATE EXTENSION IF NOT EXISTS vector;")
                 self.connection.commit()
-                self.supports_vector_store = True
+                self._supports_vector_store = True
                 if self.vector_dimension:
                     self._supports_vector_index = True
             except psycopg2.Error:
@@ -328,11 +320,8 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         labels, relationships, and properties
         """
 
-        # fetch graph schema information
-        n_labels, e_labels = self._get_labels()
-
         node_properties = self._get_node_properties()
-        edge_properties = self._get_edge_properties(e_labels)
+        edge_properties = self._get_edge_properties(self._get_elabels())
         triple_schema = self._get_triples()
 
         # update the dictionary representation
@@ -356,7 +345,6 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         include_types: List[str] = [],
     ) -> str:
         schema = self.get_schema(refresh=refresh)
-        print(schema)
         def filter_func(x: str) -> bool:
             return x in include_types if include_types else x not in exclude_types
 
@@ -777,8 +765,9 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             vector_query = f"""
                             SELECT
                                 t.name,
+                                t.type,
                                 (t.properties - 'labels') || '{{"embedding": null, "name": null, "id": null}}'::jsonb AS properties,
-                                1 - ((t.properties->>'embedding')::vector(3) <=> '{query.query_embedding}'::vector({query.query_embedding})) AS sim
+                                1 - ((t.properties->>'embedding')::vector(3) <=> '{query.query_embedding}'::vector({self.vector_dimension})) AS similarity
                             FROM (
                                 MATCH (n: "__Node__")
                                 WITH n, n.labels AS labels
@@ -919,7 +908,6 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         # execute the query, rolling back on an error
         with self._get_cursor() as curs:
             try:
-                print(query)
                 curs.execute(query)
                 self.connection.commit()
             except psycopg2.Error as e:
@@ -1045,7 +1033,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         triples = self._get_triples()
         return format_triples(triples)
 
-    def _get_labels(self) -> Tuple[List[str], List[str]]:
+    def _get_elabels(self) -> List[str]:
         """
         Get all labels of a graph (for both edges and vertices)
         by querying the graph metadata table directly
@@ -1068,12 +1056,4 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         )
         e_labels = e_labels_records[0]["labels"] if e_labels_records else []
 
-        n_labels_records = self.structured_query(
-            """
-            SELECT labels FROM label_catalog
-            WHERE graph_id = {}
-            """.format(self.graphid)
-        )
-        n_labels = n_labels_records[0]["labels"] if n_labels_records else []
-
-        return n_labels, e_labels
+        return e_labels

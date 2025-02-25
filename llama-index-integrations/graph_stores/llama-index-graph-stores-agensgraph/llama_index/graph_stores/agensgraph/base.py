@@ -79,18 +79,8 @@ class AgensGraphStore(GraphStore):
                     create_statement = """
                         CREATE GRAPH {};
                     """.format(graph_name)
-
-                    try:
-                        curs.execute(create_statement)
-                        self.connection.commit()
-                    except psycopg2.Error as e:
-                        raise AgensQueryException(
-                            {
-                                "message": "Could not create the graph",
-                                "detail": str(e),
-                            }
-                        )
-
+                    execute_query(curs, create_statement)
+                    self.connection.commit()
                 else:
                     raise Exception(
                         (
@@ -99,7 +89,7 @@ class AgensGraphStore(GraphStore):
                         ).format(graph_name)
                     )
 
-                curs.execute(graph_id_query)
+                execute_query(curs, graph_id_query)
                 data = curs.fetchone()
 
             # store graph id and refresh the schema
@@ -107,10 +97,8 @@ class AgensGraphStore(GraphStore):
 
             # set the graph path to the current graph
             graph_path = """SET graph_path = '{}';""".format(self.graph_name)
-            curs.execute(graph_path)
-
-            # create the flatten function
-            curs.execute(flatten_function)
+            execute_query(curs, graph_path)
+            execute_query(curs, flatten_function)
 
             self.refresh_schema()
             self.query(
@@ -121,18 +109,11 @@ class AgensGraphStore(GraphStore):
                 % (self.node_label, self.node_label)
             )
 
+    @require_psycopg2
     def _get_cursor(self) -> psycopg2.extras.NamedTupleCursor:
         """
         get cursor and set graph_path to the current graph
         """
-
-        try:
-            import psycopg2.extras
-        except ImportError as e:
-            raise ImportError(
-                "Unable to import psycopg2, please install with "
-                "`pip install -U psycopg2`."
-            ) from e
         cursor = self.connection.cursor(cursor_factory=psycopg2.extras.NamedTupleCursor)
         return cursor
 
@@ -140,6 +121,7 @@ class AgensGraphStore(GraphStore):
     def client(self) -> Any:
         return self.connection
 
+    @require_psycopg2
     def get(self, subj: str) -> List[List[str]]:
         """Get triplets."""
         query = """
@@ -149,7 +131,7 @@ class AgensGraphStore(GraphStore):
         """.format(self.node_label, self.node_label, subj)
 
         with self._get_cursor() as curs:
-            curs.execute(query)
+            execute_query(curs, query)
             rows = curs.fetchall()
         
         result = []
@@ -351,6 +333,7 @@ class AgensGraphStore(GraphStore):
 
         return d
 
+    @require_psycopg2
     def query(self, query: str, params: dict = {}) -> List[Dict[str, Any]]:
         """
         Query the graph by taking a cypher query, executing it and
@@ -389,7 +372,8 @@ class AgensGraphStore(GraphStore):
                 result = [self._record_to_dict(d) for d in data]
 
             return result
-        
+
+    @require_psycopg2
     def _get_node_properties(self, n_labels: List[str]) -> List[Dict[str, Any]]:
         """
         Fetch a list of available node properties by node label to be used
@@ -426,15 +410,7 @@ class AgensGraphStore(GraphStore):
                     n_label=label
                 )
 
-                try:
-                    curs.execute(q)
-                except psycopg2.Error as e:
-                    raise AgensQueryException(
-                        {
-                            "message": "Error fetching node properties",
-                            "detail": str(e),
-                        }
-                    )
+                execute_query(curs, q)
                 data = curs.fetchall()
 
                 # build a set of distinct properties
@@ -451,6 +427,7 @@ class AgensGraphStore(GraphStore):
 
         return node_properties
 
+    @require_psycopg2
     def _get_edge_properties(self, e_labels: List[str]) -> List[Dict[str, Any]]:
         """
         Fetch a list of available edge properties by edge label to be used
