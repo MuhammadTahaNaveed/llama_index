@@ -27,8 +27,8 @@ pytestmark = pytest.mark.skipif(
 @pytest.fixture()
 def agens_graph_store() -> AgensGraphStore:
     """
-    Provides a fresh Neo4jGraphStore for each test.
-    Adjust parameters to match your test database or local Neo4j setup.
+    Provides a fresh AgensGraphStore for each test.
+    Adjust parameters to match your test database or local AgensGraph setup.
     """
     conf = {
         "database": agens_db,

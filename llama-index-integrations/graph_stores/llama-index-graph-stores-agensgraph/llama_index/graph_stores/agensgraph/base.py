@@ -264,7 +264,7 @@ class AgensGraphStore(GraphStore):
         }
 
     def get_schema(self, refresh: bool = False) -> str:
-        """Get the schema of the FalkorDBGraph store."""
+        """Get the schema of the AgensGraph store."""
         if self.schema and not refresh:
             return self.schema
         self.refresh_schema()
@@ -311,10 +311,6 @@ class AgensGraphStore(GraphStore):
 
                 if vertex:
                     d[k] = json.loads(vertex.group(3))
-
-                # convert edge from id-label->id by replacing id with node information
-                # we only do this if the vertex was also returned in the query
-                # this is an attempt to be consistent with neo4j implementation
                 elif edge:
                     elabel, edge_id, start_id, end_id, properties = edge.groups()
                     d[k] = (

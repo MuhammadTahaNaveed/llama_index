@@ -4,6 +4,7 @@ import pytest
 from llama_index.graph_stores.agensgraph import AgensPropertyGraphStore
 from llama_index.core.graph_stores.types import EntityNode, ChunkNode, Relation
 from llama_index.core.vector_stores.types import VectorStoreQuery
+from llama_index.core.schema import TextNode
 
 
 agens_db = os.environ.get("AGENS_DB")
@@ -30,7 +31,7 @@ pytestmark = pytest.mark.skipif(
 def agens_store() -> AgensPropertyGraphStore:
     print("Creating AgensPropertyGraphStore fixture")
     if not agens_available:
-        pytest.skip("No Neo4j credentials provided")
+        pytest.skip("No agensgraph credentials provided")
     
     conf = {
         "database": agens_db,
@@ -218,8 +219,7 @@ def test_09_delete_nodes_by_properties(agens_store: AgensPropertyGraphStore):
 def test_10_vector_query(agens_store: AgensPropertyGraphStore):
     """
     Test vector_query with some dummy embeddings.
-    Note: This requires Neo4j 5.23+ for native vector indexing,
-    or it falls back to approximate "cosine" with APOC.
+    Note: This requires pgvector to be installed in the AgensGraph database.
     """
     entity1 = EntityNode(
         label="PERSON", name="Alice", properties={"embedding": [0.1, 0.2, 0.3]}
@@ -331,3 +331,65 @@ def test_15_refresh_schema(agens_store: AgensPropertyGraphStore):
     person_props = schema["node_props"].get("PERSON", [])
     prop_names = {prop["property"] for prop in person_props}
     assert "age" in prop_names, "Expected 'age' property in PERSON schema."
+
+def test_16_pg_store_all(agens_store: AgensPropertyGraphStore) -> None:
+    """Test functions for Agensgraph graph store."""
+
+    # Test inserting nodes into AgensGraph.
+    entity1 = EntityNode(label="PERSON", name="Logan", properties={"age": 28})
+    entity2 = EntityNode(label="ORGANIZATION", name="LlamaIndex")
+    agens_store.upsert_nodes([entity1, entity2])
+    # Assert the nodes are inserted correctly
+    kg_nodes = agens_store.get(ids=[entity1.id])
+    assert kg_nodes[0].name == entity1.name
+
+    # Test inserting relations into AgensGraph.
+    relation = Relation(
+        label="WORKS_FOR",
+        source_id=entity1.id,
+        target_id=entity2.id,
+        properties={"since": 2023},
+    )
+
+    agens_store.upsert_relations([relation])
+    # Assert the relation is inserted correctly by retrieving the relation map
+    kg_nodes = agens_store.get(ids=[entity1.id])
+    agens_store.get_rel_map(kg_nodes, depth=1)
+
+    # Test inserting a source text node and 'MENTIONS' relations.
+    source_node = TextNode(text='Logan (age 28), works for "LlamaIndex" since 2023.')
+
+    relations = [
+        Relation(label="MENTIONS", target_id=entity1.id, source_id=source_node.node_id),
+        Relation(label="MENTIONS", target_id=entity2.id, source_id=source_node.node_id),
+    ]
+
+    agens_store.upsert_llama_nodes([source_node])
+    agens_store.upsert_relations(relations)
+
+    # Assert the source node and relations are inserted correctly
+    agens_store.get_llama_nodes([source_node.node_id])
+
+    # Test retrieving nodes by properties.
+    kg_nodes = agens_store.get(properties={"age": 28})
+
+    # Test executing a structured query in AgensGraph.
+    query = """MATCH (n:"__Node__") WHERE '__Entity__' IN n.labels
+               RETURN n"""
+    agens_store.structured_query(query)
+
+    # Test upserting a new node with additional properties.
+    new_node = EntityNode(
+        label="PERSON", name="Logan", properties={"age": 28, "location": "Canada"}
+    )
+    agens_store.upsert_nodes([new_node])
+
+    # Assert the node has been updated with the new property
+    kg_nodes = agens_store.get(properties={"age": 28})
+
+    # Test deleting nodes from AgensGraph.
+    agens_store.delete(ids=[source_node.node_id])
+    agens_store.delete(ids=[entity1.id, entity2.id])
+
+    # Assert the nodes have been deleted
+    agens_store.get(ids=[entity1.id, entity2.id])

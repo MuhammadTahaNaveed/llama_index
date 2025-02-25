@@ -1,1 +1,1 @@
-# LlamaIndex Graph Stores Integration: Kuzu
+# LlamaIndex Graph Stores Integration: [AgensGraph](https://github.com/bitnine-oss/agensgraph)

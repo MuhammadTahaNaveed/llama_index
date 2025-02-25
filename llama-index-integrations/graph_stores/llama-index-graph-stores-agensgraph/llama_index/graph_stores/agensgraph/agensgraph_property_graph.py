@@ -1,4 +1,4 @@
-from typing import Any, List, Dict, Optional, Tuple, NamedTuple, Pattern, Union
+from typing import Any, List, Dict, Optional, Tuple, NamedTuple, Pattern
 import re, json
 import logging
 
@@ -43,21 +43,6 @@ def remove_nones(input_dict):
     dict: A new dictionary with all None values removed.
     """
     return {key: value for key, value in input_dict.items() if value is not None}
-
-def verify_embedding_length(embedding: List[float], vector_dimension: int) -> bool:
-    """
-    Verify the length of the embedding vector and pad it if necessary.
-
-    Parameters:
-    embedding (List[float]): The embedding vector.
-    vector_dimension (int): The expected dimension of the embedding vector.
-
-    Returns:
-    bool: True if the embedding vector has the correct length, False otherwise.
-    """
-    if len(embedding) != vector_dimension:
-        return False
-    return True
 
 
 BASE_ENTITY_LABEL = "__Entity__"
@@ -872,10 +857,6 @@ class AgensPropertyGraphStore(PropertyGraphStore):
 
                 if vertex:
                     d[k] = json.loads(vertex.group(3))
-
-                # convert edge from id-label->id by replacing id with node information
-                # we only do this if the vertex was also returned in the query
-                # this is an attempt to be consistent with neo4j implementation
                 elif edge:
                     elabel, edge_id, start_id, end_id, properties = edge.groups()
                     d[k] = (
@@ -1035,12 +1016,10 @@ class AgensPropertyGraphStore(PropertyGraphStore):
 
     def _get_elabels(self) -> List[str]:
         """
-        Get all labels of a graph (for both edges and vertices)
-        by querying the graph metadata table directly
+        Get all edge labels of a graph
 
         Returns
-            Tuple[List[str]]: 2 lists, the first containing vertex
-                labels and the second containing edge labels
+            List[str]: containing all edge labels
         """
 
         e_labels_records = self.structured_query(
